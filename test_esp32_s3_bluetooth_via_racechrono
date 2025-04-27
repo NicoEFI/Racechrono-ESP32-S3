@@ -1,0 +1,279 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <Wire.h>
+
+#define SERVICE_UUID "00001ff8-0000-1000-8000-00805f9b34fb"
+#define CHAR_UUID_CONFIG "00000005-0000-1000-8000-00805f9b34fb"
+#define CHAR_UUID_VALUES "00000006-0000-1000-8000-00805f9b34fb"
+
+#define CMD_TYPE_REMOVE_ALL 0
+#define CMD_TYPE_REMOVE 1
+#define CMD_TYPE_ADD_INCOMPLETE 2
+#define CMD_TYPE_ADD 3
+#define CMD_TYPE_UPDATE_ALL 4
+#define CMD_TYPE_UPDATE 5
+
+#define CMD_RESULT_OK 0
+#define CMD_RESULT_PAYLOAD_OUT_OF_SEQUENCE 1
+#define CMD_RESULT_EQUATION_EXCEPTION 2
+
+#define MAX_REMAINING_PAYLOAD 2048
+#define MAX_PAYLOAD_PART 17
+#define MONITOR_NAME_MAX 32
+#define MONITORS_MAX 255
+
+static const int32_t INVALID_VALUE = 0x7fffffff;
+
+// Variables globales
+BLEServer* pServer = NULL;
+BLECharacteristic* pMonitorConfigChar = NULL;
+BLECharacteristic* pMonitorValuesChar = NULL;
+
+char monitorNames[MONITORS_MAX][MONITOR_NAME_MAX + 1];
+float monitorMultipliers[MONITORS_MAX];
+int32_t monitorValues[MONITORS_MAX];
+int nextMonitorId = 0;
+
+boolean deviceConnected = false;
+boolean monitorConfigStarted = false;
+
+// Gestion du timing avec millis()
+unsigned long lastConfigTime = 0;
+const unsigned long configInterval = 5000; // Reconfigurer toutes les 5 secondes
+
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("Client connecté (RaceChrono ?)");
+    monitorConfigStarted = false; // Forcer une reconfiguration à la connexion
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    monitorConfigStarted = false;
+    Serial.println("Client déconnecté");
+    BLEDevice::startAdvertising();
+    Serial.println("Publicité BLE redémarrée");
+  }
+};
+
+class MonitorConfigCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String value = pCharacteristic->getValue();
+    if (value.length() >= 1) {
+      int result = value[0];
+      int monitorId = value[1];
+      Serial.print("Réponse de RaceChrono pour Monitor ");
+      Serial.print(monitorId);
+      Serial.print(" : ");
+      switch (result) {
+        case CMD_RESULT_OK:
+          Serial.println("Succès");
+          break;
+        case CMD_RESULT_PAYLOAD_OUT_OF_SEQUENCE:
+          Serial.println("Erreur - Payload hors séquence");
+          break;
+        case CMD_RESULT_EQUATION_EXCEPTION:
+          Serial.println("Erreur - Exception dans l'équation");
+          break;
+        default:
+          Serial.println("Résultat inconnu");
+          break;
+      }
+    }
+  }
+};
+
+class MonitorValuesCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String value = pCharacteristic->getValue();
+    int dataPos = 0;
+    while (dataPos + 5 <= value.length()) {
+      int monitorId = (int)value[dataPos];
+      // Lire les 4 octets suivants en big-endian avec casts explicites
+      int32_t dataValue = ((uint8_t)value[dataPos + 1] << 24) |
+                          ((uint8_t)value[dataPos + 2] << 16) |
+                          ((uint8_t)value[dataPos + 3] << 8) |
+                          (uint8_t)value[dataPos + 4];
+      if (monitorId < nextMonitorId) {
+        monitorValues[monitorId] = dataValue;
+        Serial.print("Monitor ");
+        Serial.print(monitorId);
+        Serial.print(" (");
+        Serial.print(monitorNames[monitorId]);
+        Serial.print(") = ");
+        if (dataValue != INVALID_VALUE) {
+          float adjustedValue = (float)dataValue * monitorMultipliers[monitorId];
+          // Si c'est le moniteur Speed (ID 0), vérifier si < 1 km/h
+          if (monitorId == 0) {
+            if (adjustedValue < 1.0) {
+              Serial.print(0.00);
+            } else {
+              Serial.print(adjustedValue);
+            }
+            Serial.print(" km/h");
+          }
+          // Si c'est un moniteur de temps (Curr time, Prev time, Best time), afficher au format SS"MMM ou M'SS"MMM
+          else if (monitorId == 1 || monitorId == 3 || monitorId == 5) {
+            int minutes = (int)adjustedValue / 60; // Calculer les minutes
+            float secondsRemaining = adjustedValue - (minutes * 60); // Secondes restantes
+            int seconds = (int)secondsRemaining; // Secondes entières
+            int milliseconds = (int)((secondsRemaining - seconds) * 1000); // Millisecondes
+            if (minutes > 0) {
+              // Afficher M'SS"MMM (ex. 2'47"148)
+              Serial.print(minutes);
+              Serial.print("'");
+              Serial.print(seconds);
+              Serial.print("\"");
+              if (milliseconds < 100) Serial.print("0"); // Ajouter un zéro si < 100
+              if (milliseconds < 10) Serial.print("0"); // Ajouter un autre zéro si < 10
+              Serial.print(milliseconds);
+            } else {
+              // Afficher SS"MMM (ex. 35"456)
+              Serial.print(seconds);
+              Serial.print("\"");
+              if (milliseconds < 100) Serial.print("0"); // Ajouter un zéro si < 100
+              if (milliseconds < 10) Serial.print("0"); // Ajouter un autre zéro si < 10
+              Serial.print(milliseconds);
+            }
+          }
+          // Pour les autres moniteurs (Curr lap, Prev lap, Best lap), afficher la valeur brute
+          else {
+            Serial.print(adjustedValue);
+          }
+        } else {
+          Serial.print("N/A");
+        }
+        Serial.println();
+      }
+      dataPos += 5;
+    }
+  }
+};
+
+boolean sendConfigCommand(int cmdType, int monitorId, const char* payload, int payloadSequence = 0) {
+  cmdType = cmdType == CMD_TYPE_ADD_INCOMPLETE ? CMD_TYPE_ADD : cmdType;
+
+  char payloadPart[MAX_PAYLOAD_PART + 1];
+  char* remainingPayload = NULL;
+  if (payload && cmdType == CMD_TYPE_ADD) {
+    strncpy(payloadPart, payload, MAX_PAYLOAD_PART);
+    payloadPart[MAX_PAYLOAD_PART] = '\0';
+
+    int payloadLen = strlen(payload);
+    if (payloadLen > MAX_PAYLOAD_PART) {
+      int remainingPayloadLen = payloadLen - MAX_PAYLOAD_PART;
+      remainingPayload = (char*)malloc(remainingPayloadLen + 1);
+      strncpy(remainingPayload, payload + MAX_PAYLOAD_PART, remainingPayloadLen);
+      remainingPayload[remainingPayloadLen] = '\0';
+      cmdType = CMD_TYPE_ADD_INCOMPLETE;
+    }
+  } else {
+    payloadPart[0] = '\0';
+  }
+
+  byte bytes[20];
+  bytes[0] = (byte)cmdType;
+  bytes[1] = (byte)monitorId;
+  bytes[2] = (byte)payloadSequence;
+  memcpy(bytes + 3, payloadPart, strlen(payloadPart));
+
+  pMonitorConfigChar->setValue(bytes, 3 + strlen(payloadPart));
+  pMonitorConfigChar->indicate();
+
+  if (remainingPayload) {
+    boolean result = sendConfigCommand(CMD_TYPE_ADD, monitorId, remainingPayload, payloadSequence + 1);
+    free(remainingPayload);
+    return result;
+  }
+  return true;
+}
+
+boolean addMonitor(const char* monitorName, const char* filterDef, float multiplier) {
+  if (nextMonitorId < MONITORS_MAX) {
+    if (!sendConfigCommand(CMD_TYPE_ADD, nextMonitorId, filterDef)) {
+      Serial.print("Échec de l'ajout du moniteur : ");
+      Serial.println(monitorName);
+      return false;
+    }
+    strncpy(monitorNames[nextMonitorId], monitorName, MONITOR_NAME_MAX);
+    monitorNames[nextMonitorId][MONITOR_NAME_MAX] = '\0';
+    monitorMultipliers[nextMonitorId] = multiplier;
+    nextMonitorId++;
+    Serial.print("Moniteur ajouté : ");
+    Serial.print(monitorName);
+    Serial.print(" (ID ");
+    Serial.print(nextMonitorId - 1);
+    Serial.println(")");
+  }
+  return true;
+}
+
+boolean configureMonitors() {
+  nextMonitorId = 0;
+  // RaceChrono envoie la vitesse en m/s, multiplier par 100 pour plus de précision, puis ajuster
+  if (!addMonitor("Speed", "channel(device(gps), speed)*100.0", 0.036) || // 0.036 = 3.6 / 100
+      !addMonitor("Curr lap", "channel(device(lap), lap_number)", 1.0) ||
+      !addMonitor("Curr time", "channel(device(lap), lap_time)*10.0", 0.1) ||
+      !addMonitor("Prev lap", "channel(device(lap), previous_lap_number)", 1.0) ||
+      !addMonitor("Prev time", "channel(device(lap), previous_lap_time)*10.0", 0.1) ||
+      !addMonitor("Best lap", "channel(device(lap), best_lap_number)", 1.0) ||
+      !addMonitor("Best time", "channel(device(lap), best_lap_time)*10.0", 0.1)) {
+    return false;
+  }
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Délai initial pour stabiliser la connexion série
+  Serial.println("Serveur BLE démarré");
+
+  BLEDevice::init("ESP32-S3 DIY");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pMonitorConfigChar = pService->createCharacteristic(
+    CHAR_UUID_CONFIG,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_INDICATE
+  );
+  pMonitorConfigChar->setCallbacks(new MonitorConfigCallbacks());
+  BLEDescriptor *pDescriptor = new BLEDescriptor(BLEUUID((uint16_t)0x2902));
+  uint8_t descValue[] = {0x02, 0x00};
+  pDescriptor->setValue(descValue, 2);
+  pMonitorConfigChar->addDescriptor(pDescriptor);
+
+  pMonitorValuesChar = pService->createCharacteristic(
+    CHAR_UUID_VALUES,
+    BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pMonitorValuesChar->setCallbacks(new MonitorValuesCallbacks());
+
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->start();
+  Serial.println("Publicité BLE démarrée");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Gestion de la configuration des moniteurs avec millis()
+  if (deviceConnected && !monitorConfigStarted && (currentTime - lastConfigTime >= configInterval)) {
+    for (int i = 0; i < MONITORS_MAX; i++) {
+      monitorValues[i] = INVALID_VALUE;
+    }
+    monitorConfigStarted = true;
+    Serial.println("Configuration des moniteurs...");
+    if (configureMonitors()) {
+      Serial.println("Configuration terminée");
+    } else {
+      Serial.println("Échec de la configuration");
+    }
+    lastConfigTime = currentTime;
+  }
+}
