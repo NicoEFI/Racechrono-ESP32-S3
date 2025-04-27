@@ -36,25 +36,175 @@ int nextMonitorId = 0;
 
 boolean deviceConnected = false;
 boolean monitorConfigStarted = false;
+boolean initialTimeDisplayed = false;
 
-// Gestion du timing avec millis()
 unsigned long lastConfigTime = 0;
-const unsigned long configInterval = 5000; // Reconfigurer toutes les 5 secondes
+const unsigned long configInterval = 5000;
+
+int32_t lastTimestamp = -1;
+int lastDisplayedMinute = -1;
+int32_t lastCurrLap = -1;
+int32_t lastCurrTime = 0;
+int32_t bestTime = INVALID_VALUE;
+
+// Variables pour l'affichage en continu
+unsigned long lastDisplayTime = 0;
+const unsigned long displayInterval = 100; // Afficher toutes les 100 ms
+float lastSpeed = 0.0;
+int32_t lastCurrLapValue = -1;
+int32_t lastCurrTimeValue = 0;
+int lastDay = -1, lastMonth = -1, lastYear = -1;
+int lastHours = -1, lastMinutes = -1;
 
 class MyServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     deviceConnected = true;
     Serial.println("Client connecté (RaceChrono ?)");
-    monitorConfigStarted = false; // Forcer une reconfiguration à la connexion
+    monitorConfigStarted = false;
+    initialTimeDisplayed = false;
+    lastDisplayedMinute = -1;
+    lastCurrLap = -1;
+    lastCurrTime = 0;
+    bestTime = INVALID_VALUE;
+    lastSpeed = 0.0;
+    lastCurrLapValue = -1;
+    lastCurrTimeValue = 0;
+    lastDay = -1;
+    lastMonth = -1;
+    lastYear = -1;
+    lastHours = -1;
+    lastMinutes = -1;
   }
   void onDisconnect(BLEServer* pServer) {
     deviceConnected = false;
     monitorConfigStarted = false;
+    initialTimeDisplayed = false;
+    lastDisplayedMinute = -1;
+    lastCurrLap = -1;
+    lastCurrTime = 0;
+    bestTime = INVALID_VALUE;
+    lastSpeed = 0.0;
+    lastCurrLapValue = -1;
+    lastCurrTimeValue = 0;
+    lastDay = -1;
+    lastMonth = -1;
+    lastYear = -1;
+    lastHours = -1;
+    lastMinutes = -1;
     Serial.println("Client déconnecté");
     BLEDevice::startAdvertising();
     Serial.println("Publicité BLE redémarrée");
   }
 };
+
+void timestampToDate(int32_t timestamp, int &day, int &month, int &year) {
+  timestamp += 2 * 3600;
+  const int secondsPerDay = 86400;
+  int daysSinceEpoch = timestamp / secondsPerDay;
+
+  year = 1970;
+  int daysInYear;
+  while (daysSinceEpoch >= (daysInYear = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 366 : 365)) {
+    daysSinceEpoch -= daysInYear;
+    year++;
+  }
+
+  int daysInMonth[] = {31, (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  month = 1;
+  while (daysSinceEpoch >= daysInMonth[month - 1]) {
+    daysSinceEpoch -= daysInMonth[month - 1];
+    month++;
+  }
+
+  day = daysSinceEpoch + 1;
+  year = year % 100;
+}
+
+void displayTime(int32_t timeInMs) {
+  float adjustedValue = (float)timeInMs * 0.001;
+  int minutes = (int)adjustedValue / 60;
+  float secondsRemaining = adjustedValue - (minutes * 60);
+  int seconds = (int)secondsRemaining;
+  int milliseconds = (int)((secondsRemaining - seconds) * 1000.0 + 0.5);
+  if (minutes > 0) {
+    Serial.print(minutes);
+    Serial.print("'");
+    Serial.print(seconds);
+    Serial.print("\"");
+    if (milliseconds < 100) Serial.print("0");
+    if (milliseconds < 10) Serial.print("0");
+    Serial.print(milliseconds);
+  } else {
+    Serial.print(seconds);
+    Serial.print("\"");
+    if (milliseconds < 100) Serial.print("0");
+    if (milliseconds < 10) Serial.print("0");
+    Serial.print(milliseconds);
+  }
+}
+
+void displayContinuousData() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastDisplayTime < displayInterval) {
+    return;
+  }
+  lastDisplayTime = currentTime;
+
+  // Afficher Date
+  if (lastDay != -1) {
+    if (lastDay < 10) Serial.print("0");
+    Serial.print(lastDay);
+    Serial.print("/");
+    if (lastMonth < 10) Serial.print("0");
+    Serial.print(lastMonth);
+    Serial.print("/");
+    if (lastYear < 10) Serial.print("0");
+    Serial.print(lastYear);
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" || ");
+
+  // Afficher Heure
+  if (lastHours != -1) {
+    if (lastHours < 10) Serial.print("0");
+    Serial.print(lastHours);
+    Serial.print(":");
+    if (lastMinutes < 10) Serial.print("0");
+    Serial.print(lastMinutes);
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" || ");
+
+  // Afficher Speed
+  Serial.print("Speed = ");
+  if (lastSpeed < 1.0) {
+    Serial.print("0.00");
+  } else {
+    Serial.print(lastSpeed);
+  }
+  Serial.print(" km/h || ");
+
+  // Afficher Curr lap
+  Serial.print("Curr lap ");
+  if (lastCurrLapValue != -1) {
+    Serial.print(lastCurrLapValue);
+  } else {
+    Serial.print("N/A");
+  }
+  Serial.print(" || ");
+
+  // Afficher Curr time
+  Serial.print("Curr time = ");
+  if (lastCurrTimeValue != 0) {
+    displayTime(lastCurrTimeValue);
+  } else {
+    Serial.print("N/A");
+  }
+
+  Serial.println();
+}
 
 class MonitorConfigCallbacks: public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
@@ -89,61 +239,76 @@ class MonitorValuesCallbacks: public BLECharacteristicCallbacks {
     int dataPos = 0;
     while (dataPos + 5 <= value.length()) {
       int monitorId = (int)value[dataPos];
-      // Lire les 4 octets suivants en big-endian avec casts explicites
       int32_t dataValue = ((uint8_t)value[dataPos + 1] << 24) |
                           ((uint8_t)value[dataPos + 2] << 16) |
                           ((uint8_t)value[dataPos + 3] << 8) |
                           (uint8_t)value[dataPos + 4];
       if (monitorId < nextMonitorId) {
         monitorValues[monitorId] = dataValue;
-        Serial.print("Monitor ");
-        Serial.print(monitorId);
-        Serial.print(" (");
-        Serial.print(monitorNames[monitorId]);
-        Serial.print(") = ");
+
         if (dataValue != INVALID_VALUE) {
           float adjustedValue = (float)dataValue * monitorMultipliers[monitorId];
-          // Si c'est le moniteur Speed (ID 0), vérifier si < 1 km/h
-          if (monitorId == 0) {
-            if (adjustedValue < 1.0) {
-              Serial.print(0.00);
-            } else {
-              Serial.print(adjustedValue);
+          
+          if (monitorId == 0) { // Speed
+            lastSpeed = adjustedValue;
+            displayContinuousData();
+          }
+          else if (monitorId == 1) { // Curr lap
+            lastCurrLapValue = (int)adjustedValue;
+            if (lastCurrLap != -1 && lastCurrLap != dataValue) {
+              // Afficher Prev lap et Prev time
+              Serial.print("Prev lap = ");
+              if (lastCurrLap != -1) {
+                Serial.print(lastCurrLap);
+              } else {
+                Serial.print("N/A");
+              }
+              Serial.print(" || Prev time = ");
+              if (lastCurrTime != 0) {
+                displayTime(lastCurrTime);
+              } else {
+                Serial.print("N/A");
+              }
+              Serial.println();
+
+              // Mettre à jour Best time
+              if (lastCurrTime != 0) {
+                if (bestTime == INVALID_VALUE || lastCurrTime < bestTime) {
+                  bestTime = lastCurrTime;
+                }
+              }
+
+              // Afficher Best lap et Best time
+              Serial.print("Best lap = ");
+              if (monitorValues[5] != INVALID_VALUE) {
+                Serial.print((int)(monitorValues[5] * monitorMultipliers[5]));
+              } else {
+                Serial.print("N/A");
+              }
+              Serial.print(" || Best time = ");
+              if (bestTime != INVALID_VALUE) {
+                displayTime(bestTime);
+              } else {
+                Serial.print("N/A");
+              }
+              Serial.println();
             }
-            Serial.print(" km/h");
+            lastCurrLap = dataValue;
           }
-          // Si c'est un moniteur de temps (Curr time, Prev time, Best time), afficher au format SS"MMM ou M'SS"MMM
-          else if (monitorId == 1 || monitorId == 3 || monitorId == 5) {
-            int minutes = (int)adjustedValue / 60; // Calculer les minutes
-            float secondsRemaining = adjustedValue - (minutes * 60); // Secondes restantes
-            int seconds = (int)secondsRemaining; // Secondes entières
-            int milliseconds = (int)((secondsRemaining - seconds) * 1000); // Millisecondes
-            if (minutes > 0) {
-              // Afficher M'SS"MMM (ex. 2'47"148)
-              Serial.print(minutes);
-              Serial.print("'");
-              Serial.print(seconds);
-              Serial.print("\"");
-              if (milliseconds < 100) Serial.print("0"); // Ajouter un zéro si < 100
-              if (milliseconds < 10) Serial.print("0"); // Ajouter un autre zéro si < 10
-              Serial.print(milliseconds);
-            } else {
-              // Afficher SS"MMM (ex. 35"456)
-              Serial.print(seconds);
-              Serial.print("\"");
-              if (milliseconds < 100) Serial.print("0"); // Ajouter un zéro si < 100
-              if (milliseconds < 10) Serial.print("0"); // Ajouter un autre zéro si < 10
-              Serial.print(milliseconds);
-            }
+          else if (monitorId == 2) { // Curr time
+            lastCurrTime = dataValue;
+            lastCurrTimeValue = dataValue;
+            displayContinuousData();
           }
-          // Pour les autres moniteurs (Curr lap, Prev lap, Best lap), afficher la valeur brute
-          else {
-            Serial.print(adjustedValue);
+          else if (monitorId == 7) { // Timestamp
+            lastTimestamp = (int32_t)dataValue;
+            lastTimestamp += 2 * 3600;
+            lastMinutes = (lastTimestamp / 60) % 60;
+            lastHours = (lastTimestamp / 3600) % 24;
+            timestampToDate(lastTimestamp, lastDay, lastMonth, lastYear);
+            displayContinuousData();
           }
-        } else {
-          Serial.print("N/A");
         }
-        Serial.println();
       }
       dataPos += 5;
     }
@@ -210,14 +375,14 @@ boolean addMonitor(const char* monitorName, const char* filterDef, float multipl
 
 boolean configureMonitors() {
   nextMonitorId = 0;
-  // RaceChrono envoie la vitesse en m/s, multiplier par 100 pour plus de précision, puis ajuster
-  if (!addMonitor("Speed", "channel(device(gps), speed)*100.0", 0.036) || // 0.036 = 3.6 / 100
+  if (!addMonitor("Speed", "channel(device(gps), speed)*100.0", 0.036) ||
       !addMonitor("Curr lap", "channel(device(lap), lap_number)", 1.0) ||
-      !addMonitor("Curr time", "channel(device(lap), lap_time)*10.0", 0.1) ||
+      !addMonitor("Curr time", "channel(device(lap), lap_time)*1000.0", 0.001) ||
       !addMonitor("Prev lap", "channel(device(lap), previous_lap_number)", 1.0) ||
-      !addMonitor("Prev time", "channel(device(lap), previous_lap_time)*10.0", 0.1) ||
+      !addMonitor("Prev time", "channel(device(lap), previous_lap_time)*1000.0", 0.001) ||
       !addMonitor("Best lap", "channel(device(lap), best_lap_number)", 1.0) ||
-      !addMonitor("Best time", "channel(device(lap), best_lap_time)*10.0", 0.1)) {
+      !addMonitor("Best time", "channel(device(lap), best_lap_time)*1000.0", 0.001) ||
+      !addMonitor("Timestamp", "channel(device(gps), timestamp)", 1.0)) {
     return false;
   }
   return true;
@@ -225,7 +390,7 @@ boolean configureMonitors() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Délai initial pour stabiliser la connexion série
+  delay(1000);
   Serial.println("Serveur BLE démarré");
 
   BLEDevice::init("ESP32-S3 DIY");
@@ -262,7 +427,6 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
 
-  // Gestion de la configuration des moniteurs avec millis()
   if (deviceConnected && !monitorConfigStarted && (currentTime - lastConfigTime >= configInterval)) {
     for (int i = 0; i < MONITORS_MAX; i++) {
       monitorValues[i] = INVALID_VALUE;
